@@ -418,6 +418,35 @@ def grouped_label_text(labels_by_category):
     return "\n".join(lines)
 
 
+def status_reason(reference_totals, strapi_totals, entry_found):
+    if not entry_found:
+        return "Strapi entry not found"
+    labels = [
+        ("Exterior", "photosExterior"),
+        ("Interior", "photosInterior"),
+        ("FloorPlan", "photosFloorPlan"),
+    ]
+    mismatches = []
+    for label, category in labels:
+        reference_total = reference_totals[category]
+        strapi_total = strapi_totals.get(category, 0)
+        if reference_total != strapi_total:
+            mismatches.append(f"{label}: reference={reference_total} strapi={strapi_total}")
+    return "\n".join(mismatches)
+
+
+def compare_status(reference_totals, strapi_totals, entry_found):
+    if not entry_found:
+        return "NOK"
+    has_missing = any(reference_totals[category] > strapi_totals.get(category, 0) for category in CATEGORIES)
+    if has_missing:
+        return "NOK"
+    has_extra = any(reference_totals[category] < strapi_totals.get(category, 0) for category in CATEGORIES)
+    if has_extra:
+        return "INFO"
+    return "OK"
+
+
 try:
     entries = fetch_all_entries()
 except Exception as error:
@@ -436,17 +465,19 @@ with open(reference_csv, newline="", encoding="utf-8-sig") as input_file:
         "strapiImageLabel",
         "strapiImageFolder",
         "status",
+        "reason",
     ]
     output_fields = fieldnames + [field for field in extra_fields if field not in fieldnames]
     rows = []
     ok_count = 0
+    info_count = 0
     nok_count = 0
     for row in reader:
         reference_totals = {category: parse_photo_total(row.get(category)) for category in CATEGORIES}
         entry = find_entry(row, entry_index)
         if entry:
             strapi_totals, urls, urls_by_category, folders, folders_by_category, labels, labels_by_category = strapi_images(entry)
-            status = "OK" if all(reference_totals[category] == strapi_totals.get(category, 0) for category in CATEGORIES) else "NOK"
+            status = compare_status(reference_totals, strapi_totals, True)
             row.update({
                 "totalPhotos": total_photos_comparison(reference_totals, strapi_totals),
                 "strapiContentUrl": content_url(entry),
@@ -455,8 +486,8 @@ with open(reference_csv, newline="", encoding="utf-8-sig") as input_file:
                 "strapiImageFolder": grouped_folder_text(folders_by_category) or folder_name_filter or folder_id_filter,
             })
         else:
-            status = "NOK"
             strapi_totals = {category: 0 for category in CATEGORIES}
+            status = compare_status(reference_totals, strapi_totals, False)
             row.update({
                 "totalPhotos": total_photos_comparison(reference_totals, strapi_totals),
                 "strapiContentUrl": "",
@@ -466,8 +497,10 @@ with open(reference_csv, newline="", encoding="utf-8-sig") as input_file:
             })
         row.update({
             "status": status,
+            "reason": status_reason(reference_totals, strapi_totals, bool(entry)) if status in ("NOK", "INFO") else "",
         })
         ok_count += status == "OK"
+        info_count += status == "INFO"
         nok_count += status == "NOK"
         rows.append(row)
 
@@ -479,7 +512,7 @@ with open(report_csv, "w", newline="", encoding="utf-8") as output_file:
 
 print(f"Reference CSV: {reference_csv}")
 print(f"Report CSV: {report_csv}")
-print(f"Rows: {len(rows)} | OK: {ok_count} | NOK: {nok_count}")
+print(f"Rows: {len(rows)} | OK: {ok_count} | INFO: {info_count} | NOK: {nok_count}")
 PY
 }
 
