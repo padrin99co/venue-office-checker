@@ -6,6 +6,7 @@ ENV_FILE="${ENV_FILE:-$ROOT_DIR/.env}"
 REFERENCE_DIR="${REFERENCE_DIR:-$ROOT_DIR/reference}"
 REPORT_DIR="${REPORT_DIR:-$ROOT_DIR/report}"
 REFERENCE_CSV="${REFERENCE_CSV:-}"
+WATERMARK_STATUS_TSV="${WATERMARK_STATUS_TSV:-$REFERENCE_DIR/watermark-import-status.tsv}"
 REPORT_CSV="${REPORT_CSV:-}"
 
 if [[ ! -f "$ENV_FILE" ]]; then
@@ -45,7 +46,7 @@ export STRAPI_OFFICE_VENUE_IMAGE_FIELD="${STRAPI_OFFICE_VENUE_IMAGE_FIELD:-image
 export STRAPI_API_TOKEN="${STRAPI_API_TOKEN:-}"
 export STRAPI_API_PATH="${STRAPI_API_PATH:-}"
 export STRAPI_URL STRAPI_CONTENT_REF STRAPI_FOLDER_NAME="${STRAPI_FOLDER_NAME:-}" STRAPI_FOLDER_ID="${STRAPI_FOLDER_ID:-}"
-export REFERENCE_CSV REPORT_CSV
+export REFERENCE_CSV WATERMARK_STATUS_TSV REPORT_CSV
 
 run_checker() {
 python3 <<'PY'
@@ -56,6 +57,7 @@ import os
 import re
 import sys
 import time
+import posixpath
 import urllib.parse
 import urllib.error
 import urllib.request
@@ -75,6 +77,7 @@ image_field = os.environ.get("STRAPI_OFFICE_VENUE_IMAGE_FIELD", "image")
 api_token = os.environ.get("STRAPI_API_TOKEN", "")
 api_path = os.environ.get("STRAPI_API_PATH", "")
 reference_csv = os.environ["REFERENCE_CSV"]
+watermark_status_tsv = os.environ["WATERMARK_STATUS_TSV"]
 report_csv = os.environ["REPORT_CSV"]
 folder_name_filter = os.environ.get("STRAPI_FOLDER_NAME", "")
 folder_id_filter = os.environ.get("STRAPI_FOLDER_ID", "")
@@ -101,26 +104,52 @@ def request_json(path, params=None):
 
 
 def parse_photo_total(raw):
+    return len(parse_photo_list(raw))
+
+
+def parse_photo_list(raw):
     if raw is None:
-        return 0
+        return []
     text = str(raw).strip()
     if not text:
-        return 0
+        return []
     if text.isdigit():
-        return 1
+        return [text]
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
         try:
             data = ast.literal_eval(text)
         except (ValueError, SyntaxError):
-            return 0
+            return []
     if isinstance(data, dict):
         photos = data.get("photos", [])
-        return len(photos) if isinstance(photos, list) else 0
+        return photos if isinstance(photos, list) else []
     if isinstance(data, list):
-        return len(data)
-    return 0
+        return data
+    return []
+
+
+def image_key(value):
+    parsed = urllib.parse.urlparse(str(value or ""))
+    path = parsed.path or str(value or "")
+    return urllib.parse.unquote(posixpath.basename(path)).strip().lower()
+
+
+def load_watermark_status(path):
+    if not os.path.exists(path):
+        return None
+    records = {}
+    with open(path, newline="", encoding="utf-8-sig") as input_file:
+        reader = csv.DictReader(input_file, delimiter="\t")
+        for row in reader:
+            image = row.get("image", "")
+            output = row.get("output", "")
+            for value in (image, output):
+                key = image_key(value)
+                if key:
+                    records[key] = row
+    return records
 
 
 def slugify(value):
@@ -418,9 +447,44 @@ def grouped_label_text(labels_by_category):
     return "\n".join(lines)
 
 
-def status_reason(reference_totals, strapi_totals, entry_found):
+def watermark_reason(reference_photos, reference_totals, strapi_totals, watermark_records):
+    category_labels = [
+        ("Exterior", "photosExterior"),
+        ("Interior", "photosInterior"),
+        ("FloorPlan", "photosFloorPlan"),
+    ]
+    lines = []
+    for label, category in category_labels:
+        if reference_totals[category] <= strapi_totals.get(category, 0):
+            continue
+        if watermark_records is None:
+            lines.append(f"Watermark {label}: {watermark_status_tsv} not found")
+            continue
+        bad_items = []
+        for image in reference_photos.get(category, []):
+            key = image_key(image)
+            record = watermark_records.get(key)
+            if not record:
+                bad_items.append(f"{key or image}: not found in watermark status")
+                continue
+            record_status = str(record.get("status", "")).strip()
+            if record_status.lower() != "done":
+                message = str(record.get("message", "")).strip()
+                bad_items.append(f"{key}: {record_status or 'unknown'}{f' - {message}' if message else ''}")
+        if bad_items:
+            lines.append(f"Watermark {label}:")
+            lines.extend(bad_items[:20])
+            if len(bad_items) > 20:
+                lines.append(f"... {len(bad_items) - 20} more")
+        else:
+            lines.append(f"Watermark {label}: all reference images Done")
+    return "\n".join(lines)
+
+
+def status_reason(status, reference_totals, strapi_totals, entry_found, reference_photos, watermark_records):
     if not entry_found:
-        return "Strapi entry not found"
+        watermark_details = watermark_reason(reference_photos, reference_totals, strapi_totals, watermark_records)
+        return f"Strapi entry not found\n{watermark_details}" if watermark_details else "Strapi entry not found"
     labels = [
         ("Exterior", "photosExterior"),
         ("Interior", "photosInterior"),
@@ -430,9 +494,13 @@ def status_reason(reference_totals, strapi_totals, entry_found):
     for label, category in labels:
         reference_total = reference_totals[category]
         strapi_total = strapi_totals.get(category, 0)
-        if reference_total != strapi_total:
+        if status == "NOK" and reference_total > strapi_total:
             mismatches.append(f"{label}: reference={reference_total} strapi={strapi_total}")
-    return "\n".join(mismatches)
+        elif status == "INFO" and reference_total < strapi_total:
+            mismatches.append(f"{label}: reference={reference_total} strapi={strapi_total}")
+    watermark_details = watermark_reason(reference_photos, reference_totals, strapi_totals, watermark_records)
+    details = "\n".join(mismatches)
+    return f"{details}\n{watermark_details}" if watermark_details else details
 
 
 def compare_status(reference_totals, strapi_totals, entry_found):
@@ -454,6 +522,7 @@ except Exception as error:
     sys.exit(1)
 
 entry_index = index_entries(entries)
+watermark_records = load_watermark_status(watermark_status_tsv)
 
 with open(reference_csv, newline="", encoding="utf-8-sig") as input_file:
     reader = csv.DictReader(input_file)
@@ -473,7 +542,8 @@ with open(reference_csv, newline="", encoding="utf-8-sig") as input_file:
     info_count = 0
     nok_count = 0
     for row in reader:
-        reference_totals = {category: parse_photo_total(row.get(category)) for category in CATEGORIES}
+        reference_photos = {category: parse_photo_list(row.get(category)) for category in CATEGORIES}
+        reference_totals = {category: len(reference_photos[category]) for category in CATEGORIES}
         entry = find_entry(row, entry_index)
         if entry:
             strapi_totals, urls, urls_by_category, folders, folders_by_category, labels, labels_by_category = strapi_images(entry)
@@ -497,7 +567,7 @@ with open(reference_csv, newline="", encoding="utf-8-sig") as input_file:
             })
         row.update({
             "status": status,
-            "reason": status_reason(reference_totals, strapi_totals, bool(entry)) if status in ("NOK", "INFO") else "",
+            "reason": status_reason(status, reference_totals, strapi_totals, bool(entry), reference_photos, watermark_records) if status in ("NOK", "INFO") else "",
         })
         ok_count += status == "OK"
         info_count += status == "INFO"
