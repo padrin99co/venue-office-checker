@@ -8,6 +8,8 @@ REPORT_DIR="${REPORT_DIR:-$ROOT_DIR/report}"
 REFERENCE_CSV="${REFERENCE_CSV:-}"
 WATERMARK_STATUS_TSV="${WATERMARK_STATUS_TSV:-$REFERENCE_DIR/watermark-import-status.tsv}"
 REPORT_CSV="${REPORT_CSV:-}"
+REPORT_XLSX="${REPORT_XLSX:-}"
+OUTPUT_XLSX="${OUTPUT_XLSX:-0}"
 
 if [[ ! -f "$ENV_FILE" ]]; then
   echo "Missing env file: $ENV_FILE" >&2
@@ -38,6 +40,9 @@ if [[ -z "$REPORT_CSV" ]]; then
   stamp="$(date +%Y%m%d-%H%M%S)"
   REPORT_CSV="$REPORT_DIR/strapi-venue-images-$stamp.csv"
 fi
+if [[ "$OUTPUT_XLSX" == "1" && -z "$REPORT_XLSX" ]]; then
+  REPORT_XLSX="${REPORT_CSV%.csv}.xlsx"
+fi
 
 : "${STRAPI_URL:?STRAPI_URL missing in .env}"
 : "${STRAPI_CONTENT_REF:?STRAPI_CONTENT_REF missing in .env}"
@@ -46,7 +51,7 @@ export STRAPI_OFFICE_VENUE_IMAGE_FIELD="${STRAPI_OFFICE_VENUE_IMAGE_FIELD:-image
 export STRAPI_API_TOKEN="${STRAPI_API_TOKEN:-}"
 export STRAPI_API_PATH="${STRAPI_API_PATH:-}"
 export STRAPI_URL STRAPI_CONTENT_REF STRAPI_FOLDER_NAME="${STRAPI_FOLDER_NAME:-}" STRAPI_FOLDER_ID="${STRAPI_FOLDER_ID:-}"
-export REFERENCE_CSV WATERMARK_STATUS_TSV REPORT_CSV
+export REFERENCE_CSV WATERMARK_STATUS_TSV REPORT_CSV REPORT_XLSX OUTPUT_XLSX
 
 run_checker() {
 python3 <<'PY'
@@ -61,6 +66,8 @@ import posixpath
 import urllib.parse
 import urllib.error
 import urllib.request
+import zipfile
+from xml.sax.saxutils import escape
 
 CATEGORIES = ["photosExterior", "photosInterior", "photosFloorPlan"]
 CATEGORY_BY_SUB_TYPE = {
@@ -79,6 +86,8 @@ api_path = os.environ.get("STRAPI_API_PATH", "")
 reference_csv = os.environ["REFERENCE_CSV"]
 watermark_status_tsv = os.environ["WATERMARK_STATUS_TSV"]
 report_csv = os.environ["REPORT_CSV"]
+report_xlsx = os.environ.get("REPORT_XLSX", "")
+output_xlsx = os.environ.get("OUTPUT_XLSX", "0") == "1"
 folder_name_filter = os.environ.get("STRAPI_FOLDER_NAME", "")
 folder_id_filter = os.environ.get("STRAPI_FOLDER_ID", "")
 
@@ -150,6 +159,122 @@ def load_watermark_status(path):
                 if key:
                     records[key] = row
     return records
+
+
+def column_name(index):
+    name = ""
+    while index:
+        index, remainder = divmod(index - 1, 26)
+        name = chr(65 + remainder) + name
+    return name
+
+
+def clean_xml_text(value):
+    text = str(value if value is not None else "")
+    return "".join(char for char in text if char in "\t\n\r" or ord(char) >= 32)
+
+
+def sheet_xml(rows):
+    xml_rows = []
+    for row_index, row in enumerate(rows, 1):
+        cells = []
+        for column_index, value in enumerate(row, 1):
+            cell_ref = f"{column_name(column_index)}{row_index}"
+            text = escape(clean_xml_text(value))
+            cells.append(f'<c r="{cell_ref}" t="inlineStr" s="1"><is><t>{text}</t></is></c>')
+        xml_rows.append(f'<row r="{row_index}">{"".join(cells)}</row>')
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        '<sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>'
+        '<sheetFormatPr defaultRowHeight="15"/>'
+        '<sheetData>' + "".join(xml_rows) + '</sheetData>'
+        '</worksheet>'
+    )
+
+
+def workbook_xml():
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        '<sheets>'
+        '<sheet name="Venue Image Report" sheetId="1" r:id="rId1"/>'
+        '<sheet name="Watermark Import Status" sheetId="2" r:id="rId2"/>'
+        '</sheets>'
+        '</workbook>'
+    )
+
+
+def workbook_rels_xml():
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>'
+        '<Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet2.xml"/>'
+        '<Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>'
+        '</Relationships>'
+    )
+
+
+def root_rels_xml():
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>'
+        '</Relationships>'
+    )
+
+
+def content_types_xml():
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+        '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+        '<Override PartName="/xl/worksheets/sheet2.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+        '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
+        '</Types>'
+    )
+
+
+def styles_xml():
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        '<fonts count="1"><font><sz val="11"/><name val="Calibri"/></font></fonts>'
+        '<fills count="1"><fill><patternFill patternType="none"/></fill></fills>'
+        '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>'
+        '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
+        '<cellXfs count="2">'
+        '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
+        '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0" applyAlignment="1"><alignment vertical="top" wrapText="1"/></xf>'
+        '</cellXfs>'
+        '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>'
+        '</styleSheet>'
+    )
+
+
+def read_tsv_rows(path):
+    if not os.path.exists(path):
+        return [["status", "image", "output", "message", "updated_at"], ["missing", path, "", "Watermark import status file not found", ""]]
+    with open(path, newline="", encoding="utf-8-sig") as input_file:
+        return list(csv.reader(input_file, delimiter="\t"))
+
+
+def write_xlsx(path, report_rows, watermark_rows):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("[Content_Types].xml", content_types_xml())
+        archive.writestr("_rels/.rels", root_rels_xml())
+        archive.writestr("xl/workbook.xml", workbook_xml())
+        archive.writestr("xl/_rels/workbook.xml.rels", workbook_rels_xml())
+        archive.writestr("xl/styles.xml", styles_xml())
+        archive.writestr("xl/worksheets/sheet1.xml", sheet_xml(report_rows))
+        archive.writestr("xl/worksheets/sheet2.xml", sheet_xml(watermark_rows))
 
 
 def slugify(value):
@@ -580,8 +705,17 @@ with open(report_csv, "w", newline="", encoding="utf-8") as output_file:
     writer.writeheader()
     writer.writerows(rows)
 
+if output_xlsx:
+    if not report_xlsx:
+        report_xlsx = f"{os.path.splitext(report_csv)[0]}.xlsx"
+    report_sheet_rows = [output_fields] + [[row.get(field, "") for field in output_fields] for row in rows]
+    watermark_sheet_rows = read_tsv_rows(watermark_status_tsv)
+    write_xlsx(report_xlsx, report_sheet_rows, watermark_sheet_rows)
+
 print(f"Reference CSV: {reference_csv}")
 print(f"Report CSV: {report_csv}")
+if output_xlsx:
+    print(f"Report XLSX: {report_xlsx}")
 print(f"Rows: {len(rows)} | OK: {ok_count} | INFO: {info_count} | NOK: {nok_count}")
 PY
 }
