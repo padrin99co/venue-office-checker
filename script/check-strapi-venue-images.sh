@@ -630,7 +630,7 @@ def status_reason(status, reference_totals, strapi_totals, entry_found, referenc
 
 def compare_status(reference_totals, strapi_totals, entry_found):
     if not entry_found:
-        return "NOK"
+        return "SKIPPED"
     has_missing = any(reference_totals[category] > strapi_totals.get(category, 0) for category in CATEGORIES)
     if has_missing:
         return "NOK"
@@ -666,6 +666,7 @@ with open(reference_csv, newline="", encoding="utf-8-sig") as input_file:
     ok_count = 0
     info_count = 0
     nok_count = 0
+    skipped_count = 0
     for row in reader:
         reference_photos = {category: parse_photo_list(row.get(category)) for category in CATEGORIES}
         reference_totals = {category: len(reference_photos[category]) for category in CATEGORIES}
@@ -692,11 +693,12 @@ with open(reference_csv, newline="", encoding="utf-8-sig") as input_file:
             })
         row.update({
             "status": status,
-            "reason": status_reason(status, reference_totals, strapi_totals, bool(entry), reference_photos, watermark_records) if status in ("NOK", "INFO") else "",
+            "reason": status_reason(status, reference_totals, strapi_totals, bool(entry), reference_photos, watermark_records) if status in ("NOK", "INFO", "SKIPPED") else "",
         })
         ok_count += status == "OK"
         info_count += status == "INFO"
         nok_count += status == "NOK"
+        skipped_count += status == "SKIPPED"
         rows.append(row)
 
 os.makedirs(os.path.dirname(report_csv), exist_ok=True)
@@ -716,7 +718,7 @@ print(f"Reference CSV: {reference_csv}")
 print(f"Report CSV: {report_csv}")
 if output_xlsx:
     print(f"Report XLSX: {report_xlsx}")
-print(f"Rows: {len(rows)} | OK: {ok_count} | INFO: {info_count} | NOK: {nok_count}")
+print(f"Rows: {len(rows)} | OK: {ok_count} | INFO: {info_count} | NOK: {nok_count} | SKIPPED: {skipped_count}")
 PY
 }
 
